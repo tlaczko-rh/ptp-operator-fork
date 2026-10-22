@@ -3,6 +3,7 @@ package ptptesthelper
 import (
 	"bufio"
 	"context"
+	stderrors "errors"
 	"fmt"
 	"path/filepath"
 	"regexp"
@@ -26,6 +27,7 @@ import (
 	k8sPriviledgedDs "github.com/redhat-cne/privileged-daemonset"
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
+	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -671,6 +673,196 @@ func RestorePtp4lConf(configName, originalConf string) {
 		context.Background(), ptpCfg, metav1.UpdateOptions{}); err != nil {
 		logrus.Errorf("Failed to restore PtpConfig %s: %s", configName, err)
 	}
+}
+
+// AuthKeyRemoval snapshots only the fields changed while isolating and
+// withdrawing one participant's accepted authentication key.
+type AuthKeyRemoval struct {
+	Namespace          string
+	ConfigName         string
+	ProfileName        string
+	SecretName         string
+	IsolatedDataKey    string
+	OriginalProfile    string
+	OriginalSecretData []byte
+	SecretDataExisted  bool
+}
+
+func updateAuthSecret(namespace, name, dataKey string, data []byte, deleteKey bool) error {
+	const attempts = 5
+	var lastErr error
+	for attempt := 0; attempt < attempts; attempt++ {
+		secret, err := client.Client.CoreV1().Secrets(namespace).Get(context.Background(), name, metav1.GetOptions{})
+		if err != nil {
+			return fmt.Errorf("get Secret %s/%s: %w", namespace, name, err)
+		}
+		if secret.Data == nil && !deleteKey {
+			secret.Data = map[string][]byte{}
+		}
+		if deleteKey {
+			delete(secret.Data, dataKey)
+		} else {
+			secret.Data[dataKey] = data
+		}
+		_, err = client.Client.CoreV1().Secrets(namespace).Update(context.Background(), secret, metav1.UpdateOptions{})
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if !kerrors.IsConflict(err) {
+			return fmt.Errorf("update Secret %s/%s: %w", namespace, name, err)
+		}
+		time.Sleep(time.Second)
+	}
+	return fmt.Errorf("update Secret %s/%s after %d attempts: %w", namespace, name, attempts, lastErr)
+}
+
+func updateAuthProfile(namespace, configName, profileName, ptp4lConf string) error {
+	const attempts = 5
+	var lastErr error
+	for attempt := 0; attempt < attempts; attempt++ {
+		config, err := client.Client.PtpConfigs(namespace).Get(context.Background(), configName, metav1.GetOptions{})
+		if err != nil {
+			return fmt.Errorf("get PtpConfig %s/%s: %w", namespace, configName, err)
+		}
+		matched := 0
+		for index := range config.Spec.Profile {
+			if config.Spec.Profile[index].Name == nil || *config.Spec.Profile[index].Name != profileName {
+				continue
+			}
+			matched++
+			config.Spec.Profile[index].Ptp4lConf = &ptp4lConf
+		}
+		if matched != 1 {
+			return fmt.Errorf("expected one profile %q in PtpConfig %s/%s, found %d",
+				profileName, namespace, configName, matched)
+		}
+		_, err = client.Client.PtpConfigs(namespace).Update(context.Background(), config, metav1.UpdateOptions{})
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if !kerrors.IsConflict(err) {
+			return fmt.Errorf("update PtpConfig %s/%s: %w", namespace, configName, err)
+		}
+		time.Sleep(time.Second)
+	}
+	return fmt.Errorf("update PtpConfig %s/%s after %d attempts: %w", namespace, configName, attempts, lastErr)
+}
+
+// PrepareAuthKeyRemoval adds a participant-specific SAD entry and points only
+// the selected profile at it. The original values are restorable on any error.
+func PrepareAuthKeyRemoval(namespace, configName, profileName, secretName, isolatedDataKey string, spp, retainedKeyID int) (*AuthKeyRemoval, error) {
+	config, err := client.Client.PtpConfigs(namespace).Get(context.Background(), configName, metav1.GetOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("get PtpConfig %s/%s: %w", namespace, configName, err)
+	}
+	selection, err := testconfig.SelectProfileAuth(config, profileName, spp)
+	if err != nil {
+		return nil, fmt.Errorf("select profile %q authentication: %w", profileName, err)
+	}
+	sharedDataKey := filepath.Base(selection.SAFile)
+	secret, err := client.Client.CoreV1().Secrets(namespace).Get(context.Background(), secretName, metav1.GetOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("get Secret %s/%s: %w", namespace, secretName, err)
+	}
+	sharedSAD, exists := secret.Data[sharedDataKey]
+	if !exists || len(sharedSAD) == 0 {
+		return nil, fmt.Errorf("shared SAD data key %q not found in Secret %s/%s", sharedDataKey, namespace, secretName)
+	}
+
+	state := &AuthKeyRemoval{
+		Namespace:       namespace,
+		ConfigName:      configName,
+		ProfileName:     profileName,
+		SecretName:      secretName,
+		IsolatedDataKey: isolatedDataKey,
+	}
+	matched := 0
+	for index := range config.Spec.Profile {
+		if config.Spec.Profile[index].Name == nil || *config.Spec.Profile[index].Name != profileName {
+			continue
+		}
+		matched++
+		if config.Spec.Profile[index].Ptp4lConf == nil {
+			return nil, fmt.Errorf("profile %q has no ptp4lConf", profileName)
+		}
+		state.OriginalProfile = *config.Spec.Profile[index].Ptp4lConf
+	}
+	if matched != 1 {
+		return nil, fmt.Errorf("expected one profile %q in PtpConfig %s/%s, found %d", profileName, namespace, configName, matched)
+	}
+	state.OriginalSecretData, state.SecretDataExisted = secret.Data[isolatedDataKey]
+
+	isolatedSAFile := filepath.Join(filepath.Dir(selection.SAFile), isolatedDataKey)
+	isolatedProfile, err := testconfig.IsolateProfileAuth(state.OriginalProfile, isolatedSAFile, spp, retainedKeyID)
+	if err != nil {
+		return nil, fmt.Errorf("isolate profile %q authentication: %w", profileName, err)
+	}
+	if err := updateAuthSecret(namespace, secretName, isolatedDataKey, sharedSAD, false); err != nil {
+		return nil, err
+	}
+	if err := updateAuthProfile(namespace, configName, profileName, isolatedProfile); err != nil {
+		_ = RestoreAuthKeyRemoval(state)
+		return nil, err
+	}
+	return state, nil
+}
+
+// WithdrawAuthKey updates only the isolated SAD entry in the named Secret.
+func WithdrawAuthKey(state *AuthKeyRemoval, spp, keyID int) error {
+	if state == nil {
+		return fmt.Errorf("auth key removal state is nil")
+	}
+	secret, err := client.Client.CoreV1().Secrets(state.Namespace).Get(context.Background(), state.SecretName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("get Secret %s/%s: %w", state.Namespace, state.SecretName, err)
+	}
+	isolatedSAD, exists := secret.Data[state.IsolatedDataKey]
+	if !exists || len(isolatedSAD) == 0 {
+		return fmt.Errorf("isolated SAD data key %q not found in Secret %s/%s", state.IsolatedDataKey, state.Namespace, state.SecretName)
+	}
+	withdrawn, err := testconfig.WithdrawSADKey(string(isolatedSAD), spp, keyID)
+	if err != nil {
+		return fmt.Errorf("withdraw key %d from SPP %d: %w", keyID, spp, err)
+	}
+	return updateAuthSecret(state.Namespace, state.SecretName, state.IsolatedDataKey, []byte(withdrawn), false)
+}
+
+// RestoreAuthKeyRemovalSecret restores only the isolated Secret entry.
+func RestoreAuthKeyRemovalSecret(state *AuthKeyRemoval) error {
+	if state == nil {
+		return fmt.Errorf("auth key removal state is nil")
+	}
+	if err := updateAuthSecret(state.Namespace, state.SecretName, state.IsolatedDataKey,
+		state.OriginalSecretData, !state.SecretDataExisted); err != nil {
+		return err
+	}
+	return nil
+}
+
+// RestoreAuthKeyRemovalProfile restores only the selected PtpConfig profile.
+func RestoreAuthKeyRemovalProfile(state *AuthKeyRemoval) error {
+	if state == nil {
+		return fmt.Errorf("auth key removal state is nil")
+	}
+	return updateAuthProfile(state.Namespace, state.ConfigName, state.ProfileName, state.OriginalProfile)
+}
+
+// RestoreAuthKeyRemoval restores every field owned by this workflow and
+// attempts all restoration steps even when one fails.
+func RestoreAuthKeyRemoval(state *AuthKeyRemoval) error {
+	if state == nil {
+		return fmt.Errorf("auth key removal state is nil")
+	}
+	var restorationErrors []error
+	if err := RestoreAuthKeyRemovalSecret(state); err != nil {
+		restorationErrors = append(restorationErrors, err)
+	}
+	if err := RestoreAuthKeyRemovalProfile(state); err != nil {
+		restorationErrors = append(restorationErrors, err)
+	}
+	return stderrors.Join(restorationErrors...)
 }
 
 // WaitForConfigContent polls a ptp4l config file in the pod until it contains the expected string.

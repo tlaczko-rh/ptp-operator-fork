@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"regexp"
+	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -375,6 +378,324 @@ spp -1
 // IsAuthEnabled returns true if PTP_AUTH_ENABLED environment variable is set to "true"
 func IsAuthEnabled() bool {
 	return os.Getenv("PTP_AUTH_ENABLED") == "true"
+}
+
+// ProfileAuthSelection describes the authentication settings used by one named
+// PTP profile. Only the settings needed to isolate and withdraw a key are modeled.
+type ProfileAuthSelection struct {
+	ProfileName string
+	SAFile      string
+	SPP         int
+	Interfaces  []string
+	ActiveKeys  map[string]int
+}
+
+func settingValue(line string) (key, value string, ok bool) {
+	fields := strings.Fields(strings.SplitN(line, "#", 2)[0])
+	if len(fields) != 2 {
+		return "", "", false
+	}
+	return fields[0], fields[1], true
+}
+
+func sectionName(line string) (name string, ok bool) {
+	trimmed := strings.TrimSpace(strings.SplitN(line, "#", 2)[0])
+	if !strings.HasPrefix(trimmed, "[") || !strings.HasSuffix(trimmed, "]") {
+		return "", false
+	}
+	name = strings.TrimSpace(trimmed[1 : len(trimmed)-1])
+	return name, name != ""
+}
+
+func sadKeyID(line string) (int, bool, error) {
+	fields := strings.Fields(strings.SplitN(line, "#", 2)[0])
+	if len(fields) < 2 || !regexp.MustCompile(`^[0-9]+$`).MatchString(fields[0]) {
+		return 0, false, nil
+	}
+	keyID, err := strconv.Atoi(fields[0])
+	if err != nil {
+		return 0, true, fmt.Errorf("invalid SAD key ID %q: %w", fields[0], err)
+	}
+	return keyID, true, nil
+}
+
+// SelectProfileAuth returns the profile's global security file and every
+// network interface section using the requested SPP. It rejects missing,
+// duplicate, ambiguous, or inherited authentication settings.
+func SelectProfileAuth(config *ptpv1.PtpConfig, profileName string, spp int) (ProfileAuthSelection, error) {
+	selection := ProfileAuthSelection{
+		ProfileName: profileName,
+		SPP:         spp,
+		ActiveKeys:  map[string]int{},
+	}
+	if config == nil {
+		return selection, fmt.Errorf("ptp config is nil")
+	}
+
+	var profile *ptpv1.PtpProfile
+	for index := range config.Spec.Profile {
+		if config.Spec.Profile[index].Name != nil && *config.Spec.Profile[index].Name == profileName {
+			if profile != nil {
+				return selection, fmt.Errorf("duplicate profile %q in PtpConfig %s", profileName, config.Name)
+			}
+			profile = &config.Spec.Profile[index]
+		}
+	}
+	if profile == nil {
+		return selection, fmt.Errorf("profile %q not found in PtpConfig %s", profileName, config.Name)
+	}
+	if profile.Ptp4lConf == nil || *profile.Ptp4lConf == "" {
+		return selection, fmt.Errorf("profile %q has no ptp4lConf", profileName)
+	}
+
+	section := ""
+	globalSPPs := 0
+	for _, line := range strings.Split(*profile.Ptp4lConf, "\n") {
+		if name, isSection := sectionName(line); isSection {
+			section = name
+			continue
+		}
+		key, value, isSetting := settingValue(line)
+		if !isSetting {
+			continue
+		}
+		switch {
+		case section == "global" && key == "sa_file":
+			if selection.SAFile != "" {
+				return selection, fmt.Errorf("duplicate global sa_file in profile %q", profileName)
+			}
+			selection.SAFile = value
+		case section == "global" && key == "spp":
+			number, err := strconv.Atoi(value)
+			if err != nil {
+				return selection, fmt.Errorf("invalid global spp in profile %q: %w", profileName, err)
+			}
+			if globalSPPs > 0 {
+				return selection, fmt.Errorf("duplicate global spp in profile %q", profileName)
+			}
+			globalSPPs++
+			if number != -1 {
+				return selection, fmt.Errorf("global spp must be -1 in profile %q, found %d", profileName, number)
+			}
+		case section != "" && section != "global" && key == "spp":
+			number, err := strconv.Atoi(value)
+			if err != nil {
+				return selection, fmt.Errorf("invalid spp for section %q in profile %q: %w", section, profileName, err)
+			}
+			if number == spp {
+				if _, exists := selection.ActiveKeys[section]; exists {
+					return selection, fmt.Errorf("duplicate spp for section %q in profile %q", section, profileName)
+				}
+				selection.Interfaces = append(selection.Interfaces, section)
+			}
+		case slices.Contains(selection.Interfaces, section) && key == "active_key_id":
+			number, err := strconv.Atoi(value)
+			if err != nil {
+				return selection, fmt.Errorf("invalid active_key_id for section %q in profile %q: %w", section, profileName, err)
+			}
+			if _, exists := selection.ActiveKeys[section]; exists {
+				return selection, fmt.Errorf("duplicate active_key_id for section %q in profile %q", section, profileName)
+			}
+			selection.ActiveKeys[section] = number
+		}
+	}
+	if selection.SAFile == "" {
+		return selection, fmt.Errorf("global sa_file not found in profile %q", profileName)
+	}
+	if globalSPPs == 0 {
+		return selection, fmt.Errorf("global spp not found in profile %q", profileName)
+	}
+	if len(selection.Interfaces) == 0 {
+		return selection, fmt.Errorf("no interface uses SPP %d in profile %q", spp, profileName)
+	}
+	for _, iface := range selection.Interfaces {
+		if _, exists := selection.ActiveKeys[iface]; !exists {
+			return selection, fmt.Errorf("active_key_id not found for interface %q in profile %q", iface, profileName)
+		}
+	}
+	sort.Strings(selection.Interfaces)
+	return selection, nil
+}
+
+// IsolateProfileAuth points a profile at a participant-specific security file and
+// retains a valid transmit key on every interface sharing the requested SPP.
+func IsolateProfileAuth(ptp4lConf, saFile string, spp, retainedKeyID int) (string, error) {
+	if saFile == "" {
+		return "", fmt.Errorf("isolated sa_file must not be empty")
+	}
+	if retainedKeyID < 0 {
+		return "", fmt.Errorf("retained key ID must not be negative")
+	}
+	lines := strings.Split(ptp4lConf, "\n")
+	section := ""
+	saFiles := 0
+	matchingInterfaces := make(map[string]bool)
+	activeKeys := make(map[string]int)
+	for index, line := range lines {
+		if name, isSection := sectionName(line); isSection {
+			section = name
+			continue
+		}
+		key, value, isSetting := settingValue(line)
+		if !isSetting {
+			continue
+		}
+		switch {
+		case section == "global" && key == "sa_file":
+			saFiles++
+			lines[index] = "sa_file " + saFile
+		case section == "global" && key == "spp":
+			number, err := strconv.Atoi(value)
+			if err != nil || number != -1 {
+				return "", fmt.Errorf("global spp must be -1, found %q", value)
+			}
+		case section != "" && section != "global" && key == "spp":
+			number, err := strconv.Atoi(value)
+			if err != nil {
+				return "", fmt.Errorf("invalid spp for section %q: %w", section, err)
+			}
+			if number == spp {
+				matchingInterfaces[section] = true
+			}
+		case matchingInterfaces[section] && key == "active_key_id":
+			if _, exists := activeKeys[section]; exists {
+				return "", fmt.Errorf("duplicate active_key_id for section %q", section)
+			}
+			number, err := strconv.Atoi(value)
+			if err != nil {
+				return "", fmt.Errorf("invalid active_key_id for section %q: %w", section, err)
+			}
+			activeKeys[section] = number
+			lines[index] = "active_key_id " + strconv.Itoa(retainedKeyID)
+		}
+	}
+	if saFiles != 1 {
+		return "", fmt.Errorf("expected exactly one global sa_file, found %d", saFiles)
+	}
+	if len(matchingInterfaces) == 0 {
+		return "", fmt.Errorf("no interface uses SPP %d", spp)
+	}
+	for iface := range matchingInterfaces {
+		if _, exists := activeKeys[iface]; !exists {
+			return "", fmt.Errorf("active_key_id not found for interface %q", iface)
+		}
+	}
+	return strings.Join(lines, "\n"), nil
+}
+
+// WithdrawSADKey removes one exact key ID from one exact SPP section while
+// preserving all unrelated security associations and settings.
+func WithdrawSADKey(sad string, spp, keyID int) (string, error) {
+	var output []string
+	inSecuritySection := false
+	inTargetSPP := false
+	targetSPPCount := 0
+	keyCount := 0
+	for _, line := range strings.Split(sad, "\n") {
+		if section, isSection := sectionName(line); isSection {
+			inSecuritySection = section == "security_association"
+			inTargetSPP = false
+			output = append(output, line)
+			continue
+		}
+		if !inSecuritySection {
+			output = append(output, line)
+			continue
+		}
+		key, value, isSetting := settingValue(line)
+		if isSetting && key == "spp" {
+			number, err := strconv.Atoi(value)
+			if err != nil {
+				return "", fmt.Errorf("invalid SAD spp %q: %w", value, err)
+			}
+			inTargetSPP = number == spp
+			if inTargetSPP {
+				targetSPPCount++
+			}
+			output = append(output, line)
+			continue
+		}
+		sadID, isSADKey, keyErr := sadKeyID(line)
+		if keyErr != nil {
+			return "", keyErr
+		}
+		if !inTargetSPP || !isSADKey {
+			output = append(output, line)
+			continue
+		}
+		if sadID != keyID {
+			output = append(output, line)
+			continue
+		}
+		keyCount++
+		if keyCount == 1 {
+			continue
+		}
+		output = append(output, line)
+	}
+	if targetSPPCount == 0 {
+		return "", fmt.Errorf("SPP %d not found", spp)
+	}
+	if targetSPPCount > 1 {
+		return "", fmt.Errorf("duplicate SPP %d sections", spp)
+	}
+	if keyCount == 0 {
+		return "", fmt.Errorf("key ID %d not found in SPP %d", keyID, spp)
+	}
+	if keyCount > 1 {
+		return "", fmt.Errorf("duplicate key ID %d in SPP %d", keyID, spp)
+	}
+	return strings.Join(output, "\n"), nil
+}
+
+// SADHasKey reports whether an exact key ID exists in an exact SPP section.
+func SADHasKey(sad string, spp, keyID int) (bool, error) {
+	inSecuritySection := false
+	inTargetSPP := false
+	targetSPPCount := 0
+	keyCount := 0
+	for _, line := range strings.Split(sad, "\n") {
+		if section, isSection := sectionName(line); isSection {
+			inSecuritySection = section == "security_association"
+			inTargetSPP = false
+			continue
+		}
+		if !inSecuritySection {
+			continue
+		}
+		key, value, isSetting := settingValue(line)
+		if isSetting && key == "spp" {
+			number, err := strconv.Atoi(value)
+			if err != nil {
+				return false, fmt.Errorf("invalid SAD spp %q: %w", value, err)
+			}
+			inTargetSPP = number == spp
+			if inTargetSPP {
+				targetSPPCount++
+			}
+			continue
+		}
+		sadID, isSADKey, keyErr := sadKeyID(line)
+		if keyErr != nil {
+			return false, keyErr
+		}
+		if !inTargetSPP || !isSADKey {
+			continue
+		}
+		if sadID == keyID {
+			keyCount++
+		}
+	}
+	if targetSPPCount == 0 {
+		return false, fmt.Errorf("SPP %d not found", spp)
+	}
+	if targetSPPCount > 1 {
+		return false, fmt.Errorf("duplicate SPP %d sections", spp)
+	}
+	if keyCount > 1 {
+		return false, fmt.Errorf("duplicate key ID %d in SPP %d", keyID, spp)
+	}
+	return keyCount == 1, nil
 }
 
 const BaseTs2PhcConfig = `[nmea]

@@ -4,11 +4,13 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 
 	ptpv1 "github.com/k8snetworkplumbingwg/ptp-operator/api/v1"
 	"github.com/k8snetworkplumbingwg/ptp-operator/test/pkg"
 	testclient "github.com/k8snetworkplumbingwg/ptp-operator/test/pkg/client"
+	"github.com/k8snetworkplumbingwg/ptp-operator/test/pkg/metrics"
 	l2lib "github.com/redhat-cne/l2discovery-lib"
 	"github.com/redhat-cne/l2discovery-lib/exports"
 	solver "github.com/redhat-cne/l2discovery-lib/pkg/graphsolver"
@@ -70,6 +72,213 @@ func TestClockNodeInfo(t *testing.T) {
 func makePtpIf(node, iface string) *exports.PtpIf {
 	return &exports.PtpIf{
 		IfClusterIndex: exports.IfClusterIndex{NodeName: node, InterfaceName: iface},
+	}
+}
+
+func TestWithdrawSADKey(t *testing.T) {
+	input := `[security_association]
+spp 0
+1 SHA256-128 HEX:zero
+
+[security_association]
+spp 1
+seqid_window 20
+1 AES128 HEX:one
+2 AES256 B64:two
+3 SHA256 26 three
+
+[security_association]
+spp 2
+1 AES128 HEX:one-again
+`
+	got, err := WithdrawSADKey(input, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `[security_association]
+spp 0
+1 SHA256-128 HEX:zero
+
+[security_association]
+spp 1
+seqid_window 20
+2 AES256 B64:two
+3 SHA256 26 three
+
+[security_association]
+spp 2
+1 AES128 HEX:one-again
+`
+	if got != want {
+		t.Fatalf("WithdrawSADKey() =\n%s\nwant\n%s", got, want)
+	}
+}
+
+func TestWithdrawSADKeyRejectsMissingAndDuplicateTargets(t *testing.T) {
+	input := `[security_association]
+spp 1
+1 AES128 HEX:one
+2 AES256 B64:two
+`
+	if got, err := WithdrawSADKey(input, 2, 1); err == nil || got != "" {
+		t.Fatalf("missing SPP expected error, got %q and %v", got, err)
+	}
+	if got, err := WithdrawSADKey(input, 1, 3); err == nil || got != "" {
+		t.Fatalf("missing key expected error, got %q and %v", got, err)
+	}
+	duplicateSPP := `[security_association]
+spp 1
+1 AES128 HEX:one
+
+[security_association]
+spp 1
+1 AES128 HEX:one
+`
+	if got, err := WithdrawSADKey(duplicateSPP, 1, 1); err == nil || got != "" {
+		t.Fatalf("duplicate SPP expected error, got %q and %v", got, err)
+	}
+	duplicateKey := `[security_association]
+spp 1
+1 AES128 HEX:one
+1 AES128 HEX:one-copy
+`
+	if got, err := WithdrawSADKey(duplicateKey, 1, 1); err == nil || got != "" {
+		t.Fatalf("duplicate key expected error, got %q and %v", got, err)
+	}
+}
+
+func TestIsolateProfileAuth(t *testing.T) {
+	input := `[global]
+sa_file /etc/ptp-secret-mount/ptp-security-conf/ptp-security.conf
+spp -1
+twoStepFlag 1
+
+[ens1f0]
+masterOnly 0
+spp 1
+active_key_id 1
+
+[ens2f0]
+masterOnly 1
+spp 1
+active_key_id 1
+
+[ens3f0]
+masterOnly 0
+spp 2
+active_key_id 3
+`
+	got, err := IsolateProfileAuth(input, "/etc/ptp-secret-mount/ptp-security-conf/cnf-19576.conf", 1, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, "sa_file /etc/ptp-secret-mount/ptp-security-conf/cnf-19576.conf") {
+		t.Fatal("global sa_file was not replaced")
+	}
+	if count := strings.Count(got, "active_key_id 2"); count != 2 {
+		t.Fatalf("expected two retained keys, found %d in:\n%s", count, got)
+	}
+	if !strings.Contains(got, "active_key_id 3") {
+		t.Fatal("unrelated SPP key was changed")
+	}
+	if !strings.Contains(got, "spp -1") || !strings.Contains(got, "spp 2") {
+		t.Fatal("unrelated spp settings were changed")
+	}
+}
+
+func TestSelectProfileAuth(t *testing.T) {
+	profileName := "test-slave1"
+	profileConf := `[global]
+sa_file /etc/ptp-secret-mount/ptp-security-conf/ptp-security.conf
+spp -1
+
+[ens1f0]
+spp 1
+active_key_id 1
+`
+	config := &ptpv1.PtpConfig{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-slave1"},
+		Spec: ptpv1.PtpConfigSpec{Profile: []ptpv1.PtpProfile{{
+			Name:      &profileName,
+			Ptp4lConf: &profileConf,
+		}}},
+	}
+	selection, err := SelectProfileAuth(config, profileName, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selection.SAFile != "/etc/ptp-secret-mount/ptp-security-conf/ptp-security.conf" {
+		t.Fatalf("unexpected sa_file %q", selection.SAFile)
+	}
+	if len(selection.Interfaces) != 1 || selection.Interfaces[0] != "ens1f0" || selection.ActiveKeys["ens1f0"] != 1 {
+		t.Fatalf("unexpected selection: %+v", selection)
+	}
+}
+
+func TestExtractMetricValuesExactLabelsAndAlias(t *testing.T) {
+	metricsText := `openshift_ptp_clock_state{process="ptp4l",iface="ens1fx",node="node-a"} 0
+openshift_ptp_clock_state{process="ptp4l",iface="ens1f0",node="node-a"} 1
+openshift_ptp_clock_state{process="phc2sys",iface="ens1fx",node="node-a"} 2
+`
+	values, err := metrics.ExtractMetricValues(metricsText, metrics.OpenshiftPtpClockState, "node-a", "ens1fx", "ptp4l")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(values) != 1 || values[0] != "0" {
+		t.Fatalf("unexpected values: %v", values)
+	}
+}
+
+func TestExtractMetricValuesRejectsMissingAndAmbiguousSamples(t *testing.T) {
+	missing := `openshift_ptp_clock_state{process="ptp4l",iface="ens1fx",node="node-b"} 0
+`
+	if values, err := metrics.ExtractMetricValues(missing, metrics.OpenshiftPtpClockState, "node-a", "ens1fx", "ptp4l"); err == nil {
+		t.Fatalf("expected missing metric error, got %v", values)
+	}
+	ambiguous := `openshift_ptp_clock_state{process="ptp4l",iface="ens1fx",node="node-a"} 0
+openshift_ptp_clock_state{process="ptp4l",iface="ens1fx",node="node-a"} 1
+`
+	if values, err := metrics.ExtractMetricValues(ambiguous, metrics.OpenshiftPtpClockState, "node-a", "ens1fx", "ptp4l"); err == nil {
+		t.Fatalf("expected ambiguous metric error, got %v", values)
+	}
+}
+
+func TestParseMetricValues(t *testing.T) {
+	if value, err := metrics.ParseMetricInteger("-12"); err != nil || value != -12 {
+		t.Fatalf("valid integer failed: %d, %v", value, err)
+	}
+	for _, value := range []string{"", "0.5", "0junk", "NaN", "+Inf", "1e3"} {
+		if parsed, err := metrics.ParseMetricInteger(value); err == nil {
+			t.Fatalf("ParseMetricInteger(%q) unexpectedly returned %d", value, parsed)
+		}
+	}
+	if state, err := metrics.ParseClockStateValue("2"); err != nil || state != metrics.MetricClockStateHoldOver {
+		t.Fatalf("valid clock state failed: %d, %v", state, err)
+	}
+	if _, err := metrics.ParseClockStateValue("3"); err == nil {
+		t.Fatal("out-of-range clock state unexpectedly parsed")
+	}
+	if status, err := metrics.ParseProcessStatusValue("1"); err != nil || status != 1 {
+		t.Fatalf("valid process status failed: %d, %v", status, err)
+	}
+	if _, err := metrics.ParseProcessStatusValue("2"); err == nil {
+		t.Fatal("out-of-range process status unexpectedly parsed")
+	}
+}
+
+func TestExtractProcessStatus(t *testing.T) {
+	metricsText := `openshift_ptp_process_status{config="ptp4l.0.config",node="node-a",process="ptp4l"} 1
+openshift_ptp_process_status{config="ptp4l.1.config",node="node-a",process="ptp4l"} 0
+`
+	status, err := metrics.ExtractProcessStatus(metricsText, "node-a", "ptp4l.0.config", "ptp4l")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != 1 {
+		t.Fatalf("unexpected process status: %d", status)
+	}
+	if status, err := metrics.ExtractProcessStatus(metricsText, "node-a", "ptp4l.9.config", "ptp4l"); err == nil {
+		t.Fatalf("expected missing process status error, got %d", status)
 	}
 }
 

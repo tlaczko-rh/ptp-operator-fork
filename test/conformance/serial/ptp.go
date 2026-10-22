@@ -3,10 +3,13 @@ package test
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"sort"
@@ -431,11 +434,29 @@ var _ = Describe("["+strings.ToLower(DesiredMode.String())+"-serial]", Serial, f
 		Context("PTP Interfaces discovery", func() {
 
 			BeforeEach(func() {
+				isCNF19576Spec := false
+				for _, label := range CurrentSpecReport().LeafNodeLabels {
+					if label == "CNF-19576" {
+						isCNF19576Spec = true
+						break
+					}
+				}
+				if isCNF19576Spec {
+					if !testconfig.IsAuthEnabled() {
+						Skip("CNF-19576 requires PTP_AUTH_ENABLED=true")
+					}
+					if DesiredMode != testconfig.OrdinaryClock && DesiredMode != testconfig.BoundaryClock {
+						Skip("CNF-19576 initially supports only OC and single-NIC BC")
+					}
+				}
 				By("Refreshing configuration", func() {
 					ptphelper.WaitForPtpDaemonToExist()
 					fullConfig = testconfig.GetFullDiscoveredConfig(pkg.PtpLinuxDaemonNamespace, true)
 				})
 				if fullConfig.Status == testconfig.DiscoveryFailureStatus {
+					if isCNF19576Spec {
+						Fail("CNF-19576 failed to discover a valid authenticated OC/BC configuration")
+					}
 					Skip("Failed to find a valid ptp slave configuration")
 				}
 
@@ -643,6 +664,171 @@ var _ = Describe("["+strings.ToLower(DesiredMode.String())+"-serial]", Serial, f
 					checkClockClassState(fullConfig, strconv.Itoa(int(expectedClockClass)), pkg.TimeoutIn5Minutes)
 				}
 			})
+
+			It("Slave loses synchronization when its upstream authentication key is removed [CNF-19576]",
+				Label("CNF-19576"), func() {
+					const (
+						authSPP             = 1
+						withdrawnKeyID      = 1
+						retainedKeyID       = 2
+						isolatedDataKey     = "cnf-19576-ptp-security.conf"
+						authSampleInterval  = 5 * time.Second
+						authBaselineWindow  = 60 * time.Second
+						authLossWindow      = 2 * time.Minute
+						authProjectionWait  = 5 * time.Minute
+						authRejectionWait   = 3 * time.Minute
+						authRecoveryTimeout = 5 * time.Minute
+					)
+
+					rejectionPattern := os.Getenv("PTP_AUTH_REJECTION_REGEX")
+					Expect(rejectionPattern).NotTo(BeEmpty(),
+						"PTP_AUTH_REJECTION_REGEX must contain the target-build-validated diagnostic that is scoped to the selected profile and upstream port")
+					_, err := regexp.Compile(rejectionPattern)
+					Expect(err).NotTo(HaveOccurred(), "PTP_AUTH_REJECTION_REGEX is invalid")
+
+					Expect(fullConfig.DiscoveredClockUnderTestPtpConfig).NotTo(BeNil(), "clock-under-test PtpConfig is required")
+					targetConfig := (*ptpv1.PtpConfig)(fullConfig.DiscoveredClockUnderTestPtpConfig)
+					profileName, err := ptphelper.GetProfileName(targetConfig, true)
+					Expect(err).NotTo(HaveOccurred(), "could not get clock-under-test profile name")
+					selection, err := testconfig.SelectProfileAuth(targetConfig, profileName, authSPP)
+					Expect(err).NotTo(HaveOccurred(), "selected profile has invalid authentication settings")
+					targetFollowerInterfaces := ptpv1.GetInterfaces(*targetConfig, ptpv1.Slave)
+					Expect(targetFollowerInterfaces).To(HaveLen(1),
+						"CNF-19576 requires exactly one independent upstream receive interface on the selected profile")
+					followerInterface := targetFollowerInterfaces[0]
+					Expect(selection.Interfaces).To(ContainElement(followerInterface),
+						"the discovered upstream interface does not use the selected authenticated profile SPP")
+
+					sharedDataKey := filepath.Base(selection.SAFile)
+					sharedSADBytes, err := getCNF19576SecretData(pkg.PtpLinuxDaemonNamespace, "ptp-security-conf", sharedDataKey)
+					Expect(err).NotTo(HaveOccurred(), "could not read the preprovisioned authentication Secret")
+					sharedSAD := string(sharedSADBytes)
+					hasWithdrawnKey, err := testconfig.SADHasKey(sharedSAD, authSPP, withdrawnKeyID)
+					Expect(err).NotTo(HaveOccurred(), "shared SAD is malformed")
+					Expect(hasWithdrawnKey).To(BeTrue(), "shared SAD must contain upstream key ID 1")
+					hasRetainedKey, err := testconfig.SADHasKey(sharedSAD, authSPP, retainedKeyID)
+					Expect(err).NotTo(HaveOccurred(), "shared SAD is malformed")
+					Expect(hasRetainedKey).To(BeTrue(), "shared SAD must contain retained transmit key ID 2")
+
+					targetPod, err := ptphelper.GetPTPPodWithPTPConfig(targetConfig)
+					Expect(err).NotTo(HaveOccurred(), "could not find the selected participant pod")
+					nodeName := targetPod.Spec.NodeName
+					Expect(nodeName).NotTo(BeEmpty(), "selected participant pod has no node")
+					label, err := ptphelper.GetLabel(targetConfig)
+					Expect(err).NotTo(HaveOccurred(), "could not get selected participant label")
+					configPath, err := ptphelper.GetConfigForProfile(targetConfig.Name, profileName, label, &nodeName)
+					Expect(err).NotTo(HaveOccurred(), "could not get selected participant config path")
+					profileLogID, err := ptphelper.GetProfileLogID(targetConfig.Name, profileName, label, &nodeName)
+					Expect(err).NotTo(HaveOccurred(), "could not get selected participant log identifier")
+					isolatedSAFile := filepath.Join(filepath.Dir(selection.SAFile), isolatedDataKey)
+
+					grandmasterID := getCNF19576GrandmasterID(fullConfig)
+					checkClock := func(expectedState metrics.MetricClockState) error {
+						return metrics.CheckClockRoleAndOffset(targetConfig, label, &nodeName,
+							expectedState, metrics.MetricRoleSlave, true)
+					}
+					checkProcess := func() error {
+						return checkCNF19576ProcessRunning(nodeName, configPath)
+					}
+					observeStableClock := func(expectedState metrics.MetricClockState) error {
+						if err := checkClock(expectedState); err != nil {
+							return err
+						}
+						return checkProcess()
+					}
+
+					By("Establishing the original authenticated baseline")
+					Expect(ptptesthelper.BasicClockSyncCheck(fullConfig, targetConfig, grandmasterID,
+						metrics.MetricClockStateLocked, metrics.MetricRoleSlave, true)).To(Succeed())
+					Consistently(func() error {
+						return observeStableClock(metrics.MetricClockStateLocked)
+					}, authBaselineWindow, authSampleInterval).Should(Succeed(),
+						"original authenticated synchronization was not stable")
+
+					By("Isolating the selected participant's accepted keys")
+					state, err := ptptesthelper.PrepareAuthKeyRemoval(pkg.PtpLinuxDaemonNamespace,
+						targetConfig.Name, profileName, "ptp-security-conf", isolatedDataKey,
+						authSPP, retainedKeyID)
+					Expect(err).NotTo(HaveOccurred(), "could not stage participant-specific authentication data")
+					DeferCleanup(func() error {
+						restoreErr := ptptesthelper.RestoreAuthKeyRemoval(state)
+						if restoreErr != nil {
+							return restoreErr
+						}
+						Eventually(func() error {
+							return ptptesthelper.BasicClockSyncCheck(fullConfig, targetConfig, grandmasterID,
+								metrics.MetricClockStateLocked, metrics.MetricRoleSlave, true)
+						}, authRecoveryTimeout, pkg.Timeout10Seconds).Should(Succeed(),
+							"authentication cleanup did not recover synchronization")
+						return nil
+					})
+
+					Expect(waitForCNF19576SADProjection(nodeName, isolatedSAFile, sharedSADBytes,
+						authProjectionWait, authSampleInterval)).To(Succeed(), "isolated SAD was not projected")
+					configPath, err = ptphelper.GetConfigForProfile(targetConfig.Name, profileName, label, &nodeName)
+					Expect(err).NotTo(HaveOccurred(), "could not refresh selected participant config path")
+					By("Establishing the isolated authenticated baseline")
+					Expect(ptptesthelper.BasicClockSyncCheck(fullConfig, targetConfig, grandmasterID,
+						metrics.MetricClockStateLocked, metrics.MetricRoleSlave, true)).To(Succeed())
+					Consistently(func() error {
+						return observeStableClock(metrics.MetricClockStateLocked)
+					}, authBaselineWindow, authSampleInterval).Should(Succeed(),
+						"isolated authenticated synchronization was not stable")
+
+					By("Withdrawing only the selected participant's upstream key")
+					withdrawalTime := time.Now()
+					Expect(ptptesthelper.WithdrawAuthKey(state, authSPP, withdrawnKeyID)).To(Succeed(),
+						"could not withdraw the isolated upstream key")
+					withdrawnSADBytes, err := getCNF19576SecretData(pkg.PtpLinuxDaemonNamespace,
+						"ptp-security-conf", isolatedDataKey)
+					Expect(err).NotTo(HaveOccurred(), "could not read withdrawn SAD")
+					Expect(waitForCNF19576SADProjection(nodeName, isolatedSAFile, withdrawnSADBytes,
+						authProjectionWait, authSampleInterval)).To(Succeed(), "withdrawn SAD was not projected")
+
+					By("Requiring fresh authentication rejection evidence")
+					currentPod, err := ptphelper.GetPtpPodOnNode(nodeName)
+					Expect(err).NotTo(HaveOccurred(), "could not refresh selected participant pod")
+					matches, err := pods.GetPodLogsRegexSince(currentPod.Namespace, currentPod.Name,
+						pkg.PtpContainerName, `(?m)`+rejectionPattern, false, authRejectionWait, withdrawalTime)
+					Expect(err).NotTo(HaveOccurred(), "no fresh authentication rejection diagnostic was observed")
+					Expect(matches).NotTo(BeEmpty(), "authentication rejection diagnostic did not match")
+					profileScopedMatches := 0
+					for _, match := range matches {
+						if len(match) > 0 && strings.Contains(match[0], profileLogID) {
+							profileScopedMatches++
+						}
+					}
+					Expect(profileScopedMatches).To(BeNumerically(">", 0),
+						"authentication rejection diagnostic was not attributed to the selected profile log identifier")
+
+					By("Requiring sustained loss of synchronization")
+					Eventually(func() error {
+						return observeStableClock(metrics.MetricClockStateFreeRun)
+					}, authProjectionWait, authSampleInterval).Should(Succeed(),
+						"target did not enter FREERUN after upstream key withdrawal")
+					Consistently(func() error {
+						return observeStableClock(metrics.MetricClockStateFreeRun)
+					}, authLossWindow, authSampleInterval).Should(Succeed(),
+						"target unexpectedly synchronized after upstream key withdrawal")
+
+					By("Restoring and proving recovery")
+					Expect(ptptesthelper.RestoreAuthKeyRemovalSecret(state)).To(Succeed(),
+						"could not restore the isolated Secret entry")
+					Expect(waitForCNF19576SADProjection(nodeName, isolatedSAFile, sharedSADBytes,
+						authProjectionWait, authSampleInterval)).To(Succeed(), "restored SAD was not projected")
+					Expect(ptptesthelper.RestoreAuthKeyRemovalProfile(state)).To(Succeed(),
+						"could not restore the selected profile")
+					Expect(ptptesthelper.RestoreAuthKeyRemoval(state)).To(Succeed(), "idempotent restoration failed")
+					configPath, err = ptphelper.GetConfigForProfile(targetConfig.Name, profileName, label, &nodeName)
+					Expect(err).NotTo(HaveOccurred(), "could not refresh restored participant config path")
+					Expect(ptptesthelper.BasicClockSyncCheck(fullConfig, targetConfig, grandmasterID,
+						metrics.MetricClockStateLocked, metrics.MetricRoleSlave, true)).To(Succeed(),
+						"authentication restoration did not recover synchronization")
+					Consistently(func() error {
+						return observeStableClock(metrics.MetricClockStateLocked)
+					}, authBaselineWindow, authSampleInterval).Should(Succeed(),
+						"recovered authenticated synchronization was not stable")
+				})
 
 			It("Slave fails to sync when authentication mismatch occurs (negative test)", func() {
 				// Only run if authentication is enabled
@@ -3924,6 +4110,80 @@ func refreshPodOnNotFound(pod *v1core.Pod, err error) {
 	}
 	*pod = newPod
 	fmt.Fprintf(GinkgoWriter, "Refreshed pod reference to %s\n", pod.Name)
+}
+
+func getCNF19576GrandmasterID(fullConfig testconfig.TestConfig) *string {
+	if fullConfig.L2Config == nil || ptphelper.IsExternalGM() {
+		return nil
+	}
+	Expect(fullConfig.DiscoveredGrandMasterPtpConfig).NotTo(BeNil(), "expected local grandmaster PtpConfig")
+	gmConfig := (*ptpv1.PtpConfig)(fullConfig.DiscoveredGrandMasterPtpConfig)
+	grandmasterLabel := pkg.PtpGrandmasterNodeLabel
+	var grandmasterID string
+	Eventually(func() error {
+		var err error
+		grandmasterID, err = ptphelper.GetClockIDMaster(gmConfig.Name, pkg.PtpGrandMasterPolicyName,
+			&grandmasterLabel, nil, true)
+		return err
+	}, pkg.TimeoutIn3Minutes, pkg.Timeout10Seconds).Should(BeNil(), "timeout getting grandmaster clock ID")
+	return &grandmasterID
+}
+
+func getCNF19576SecretData(namespace, secretName, dataKey string) ([]byte, error) {
+	secret, err := client.Client.CoreV1().Secrets(namespace).Get(context.Background(), secretName, metav1.GetOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("get Secret %s/%s: %w", namespace, secretName, err)
+	}
+	data, exists := secret.Data[dataKey]
+	if !exists || len(data) == 0 {
+		return nil, fmt.Errorf("data key %q is missing or empty in Secret %s/%s", dataKey, namespace, secretName)
+	}
+	return data, nil
+}
+
+func waitForCNF19576SADProjection(nodeName, filePath string, expected []byte, timeout, interval time.Duration) error {
+	expectedDigest := sha256.Sum256(expected)
+	expectedDigestText := hex.EncodeToString(expectedDigest[:])
+	Eventually(func() error {
+		pod, err := ptphelper.GetPtpPodOnNode(nodeName)
+		if err != nil {
+			return fmt.Errorf("get linuxptp-daemon pod on node %s: %w", nodeName, err)
+		}
+		buf, _, err := pods.ExecCommand(client.Client, false, &pod, pkg.PtpContainerName,
+			[]string{"sha256sum", filePath})
+		if err != nil {
+			return fmt.Errorf("hash projected authentication file %s: %w", filePath, err)
+		}
+		fields := strings.Fields(buf.String())
+		if len(fields) != 2 {
+			return fmt.Errorf("unexpected sha256sum output for %s", filePath)
+		}
+		if fields[0] != expectedDigestText {
+			return fmt.Errorf("projected authentication file digest does not match expected digest")
+		}
+		return nil
+	}, timeout, interval).Should(Succeed())
+	return nil
+}
+
+func checkCNF19576ProcessRunning(nodeName, configPath string) error {
+	pod, err := ptphelper.GetPtpPodOnNode(nodeName)
+	if err != nil {
+		return fmt.Errorf("get linuxptp-daemon pod on node %s: %w", nodeName, err)
+	}
+	buf, _, err := pods.ExecCommand(client.Client, false, &pod, pkg.PtpContainerName,
+		[]string{"curl", "-s", pkg.MetricsEndPoint})
+	if err != nil {
+		return fmt.Errorf("fetch process status metrics: %w", err)
+	}
+	status, err := metrics.ExtractProcessStatus(buf.String(), nodeName, configPath, "ptp4l")
+	if err != nil {
+		return err
+	}
+	if status != 1 {
+		return fmt.Errorf("selected ptp4l process is not running: status=%d", status)
+	}
+	return nil
 }
 
 func checkProcessStatus(fullConfig testconfig.TestConfig, state string) {

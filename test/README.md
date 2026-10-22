@@ -56,6 +56,30 @@ for example:
 docker run -e PTP_TEST_MODE=OC -e ENABLE_TEST_CASE=reboot -v /home/usr/.kube/config.3nodes:/tmp/config:Z -v .:/output:Z quay.io/redhat-cne/ptp-operator-test:latest
 ```
 
+## CNF-19576 authentication key removal
+
+The serial test `Slave loses synchronization when its upstream authentication key is removed [CNF-19576]` starts from a working authenticated topology, isolates the clock-under-test's accepted keys in a new entry of the existing `ptp-security-conf` Secret, removes only upstream SPP 1/key ID 1, retains key ID 2 for transmit on every affected port, and then restores and rechecks synchronization.
+
+### Prerequisites
+
+- Set `PTP_AUTH_ENABLED=true` before suite configuration starts. The `ptp-security-conf` Secret and authenticated switches/GM must already be provisioned; the test does not create or administer them.
+- The initial supported modes are OC and single-NIC BC. The selected profile must have exactly one independent upstream receive interface. Unsupported modes and authentication-disabled runs skip explicitly.
+- The SAD must contain SPP 1 key IDs 1 and 2. The BC workflow changes both ports that use SPP 1 to the retained key ID 2 so removing key ID 1 does not remove the configured transmit key.
+- Complete a target-build feasibility record before enabling the run. Record the daemon/linuxptp image or version and evidence that asymmetric transmit key IDs synchronize, that `ptp4l` remains running after key ID 1 is withdrawn, and that the exact diagnostic can be attributed to the selected profile and upstream receive port.
+- Export `PTP_AUTH_REJECTION_REGEX` with the validated regular expression for that target build's authentication/key-not-found diagnostic. The regex must not match generic startup, malformed-key, or unrelated-profile failures. The test fails without this value rather than substituting an unvalidated log pattern.
+
+### Focused run
+
+```bash
+KUBECONFIG=/path/to/kubeconfig \
+PTP_TEST_MODE=OC PTP_AUTH_ENABLED=true KEEP_PTPCONFIG=true \
+PTP_AUTH_REJECTION_REGEX='<validated-target-build-regex>' \
+go run -mod=vendor github.com/onsi/ginkgo/v2/ginkgo \
+  --focus='CNF-19576' --timeout=45m -v ./test/conformance/serial
+```
+
+The test proves LOCKED before and after key isolation, requires a fresh timestamp-scoped rejection log after withdrawal, requires FREERUN for two minutes while the selected `ptp4l` process remains running, and restores the original Secret data and profile on success or assertion failure. Cleanup also requires synchronization to recover. No key bytes are printed; Secret projection is checked by comparing file digests.
+
 ## Pod Log Collection
 
 The test suite can automatically collect raw container logs from `ptp-operator`, `linuxptp-daemon-container`, and `cloud-event-proxy` containers during test execution. Logs are continuously streamed and captured even when pods restart or are deleted.

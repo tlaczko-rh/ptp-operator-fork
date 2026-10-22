@@ -113,7 +113,7 @@ func GetPtpOffeset(aIf string, nodeName *string) (metric int, err error) {
 	if err != nil {
 		return 0, fmt.Errorf("error getting offset err:%s", err)
 	}
-	offsetInt, err := strconv.Atoi(offsetString)
+	offsetInt, err := ParseMetricInteger(offsetString)
 	if err != nil {
 		return 0, fmt.Errorf("error strconv for offsetString=%s, err:%s", offsetString, err)
 	}
@@ -126,11 +126,11 @@ func CheckClockState(state MetricClockState, aIf string, nodeName *string) (err 
 	if err != nil {
 		return fmt.Errorf("error getting clock state err:%s", err)
 	}
-	clockStateInt, err := strconv.Atoi(clockStateString)
+	clockState, err := ParseClockStateValue(clockStateString)
 	if err != nil {
 		return fmt.Errorf("error strconv for clockStateString=%s, err:%s", clockStateString, err)
 	}
-	if MetricClockState(clockStateInt) != state {
+	if clockState != state {
 		return fmt.Errorf("incorrect clock state")
 	}
 	return nil
@@ -243,7 +243,7 @@ func CheckClockRole(roles []MetricRole, Ifs []string, nodeName *string) (err err
 		if err != nil {
 			return fmt.Errorf("error getting role err:%s", err)
 		}
-		roleInt, err := strconv.Atoi(roleString)
+		roleInt, err := ParseMetricInteger(roleString)
 		if err != nil {
 			return fmt.Errorf("error strconv for roleString=%s, err:%s", roleString, err)
 		}
@@ -264,7 +264,7 @@ func GetClockIfRoles(Ifs []string, nodeName *string) (roleInt []MetricRole, err 
 			return roleInt, fmt.Errorf("error getting role err:%s", err)
 		}
 		var tempInt int
-		tempInt, err = strconv.Atoi(roleString)
+		tempInt, err = ParseMetricInteger(roleString)
 		if err != nil {
 			return roleInt, fmt.Errorf("error strconv for roleString=%s, err:%s", roleString, err)
 		}
@@ -302,14 +302,12 @@ var (
 
 // gets a metric value string for a given node and interface
 func getMetric(nodeName, aIf, metricName string) (metric string, err error) {
-	const (
-		fromMaster = `from="master",`
-	)
 	ptpPods, err := client.Client.CoreV1().Pods(pkg.PtpLinuxDaemonNamespace).List(context.Background(), metav1.ListOptions{LabelSelector: "app=linuxptp-daemon"})
 	if err != nil {
 		return metric, err
 	}
 	var availableLines []string
+	var extractErrors []error
 	for index := range ptpPods.Items {
 		if ptpPods.Items[index].Spec.NodeName != nodeName {
 			continue
@@ -334,20 +332,21 @@ func getMetric(nodeName, aIf, metricName string) (metric string, err error) {
 			ifCandidates = append(ifCandidates, aliasedIf)
 		}
 
+		var values []string
 		for _, candidate := range ifCandidates {
-			var regex string
-			if metricName == OpenshiftPtpOffsetNs {
-				regex = metricName + `{` + fromMaster + `iface="` + candidate + `",node="` + node + `",process="ptp4l"} (-*[0-9]*)`
-			} else if metricName == OpenshiftPtpClockState {
-				regex = metricName + `{iface="` + candidate + `",node="` + node + `",process="ptp4l"} (-*[0-9]*)`
-			} else {
-				regex = metricName + `{iface="` + candidate + `",node="` + node + `",process="ptp4l"} (-*[0-9]*)`
+			candidateValues, extractErr := ExtractMetricValues(metrics, metricName, node, candidate, "ptp4l")
+			if extractErr != nil {
+				extractErrors = append(extractErrors, extractErr)
+				continue
 			}
-			r := regexp.MustCompile(regex)
-			for _, submatches := range r.FindAllStringSubmatchIndex(metrics, -1) {
-				metric = string(r.ExpandString([]byte{}, "$1", metrics, submatches))
-				return metric, nil
-			}
+			values = append(values, candidateValues...)
+		}
+		if len(values) == 1 {
+			return values[0], nil
+		}
+		if len(values) > 1 {
+			return metric, fmt.Errorf("metric: %s, nodeName: %s, aIf: %s has %d matching samples",
+				metricName, nodeName, aIf, len(values))
 		}
 
 		// Metric not found — collect available lines for this metric name to include in error
@@ -358,8 +357,122 @@ func getMetric(nodeName, aIf, metricName string) (metric string, err error) {
 		}
 		break
 	}
-	return metric, fmt.Errorf("metric: %s, nodeName: %s, aIf: %s not found, available %s metrics: %v",
-		metricName, nodeName, aIf, metricName, availableLines)
+	return metric, fmt.Errorf("metric: %s, nodeName: %s, aIf: %s not found; extraction errors: %v; available %s metrics: %v",
+		metricName, nodeName, aIf, extractErrors, metricName, availableLines)
+}
+
+// ParseMetricInteger rejects empty, fractional, non-finite, and prefixed numeric values.
+func ParseMetricInteger(value string) (int, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, fmt.Errorf("empty metric value")
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return 0, fmt.Errorf("invalid integer metric value %q: %w", value, err)
+	}
+	return parsed, nil
+}
+
+// ParseClockStateValue validates the complete openshift_ptp_clock_state value.
+func ParseClockStateValue(value string) (MetricClockState, error) {
+	parsed, err := ParseMetricInteger(value)
+	if err != nil {
+		return MetricClockStateFreeRun, err
+	}
+	state := MetricClockState(parsed)
+	if state != MetricClockStateFreeRun && state != MetricClockStateLocked && state != MetricClockStateHoldOver {
+		return MetricClockStateFreeRun, fmt.Errorf("invalid clock state %d", parsed)
+	}
+	return state, nil
+}
+
+// ParseProcessStatusValue validates the complete openshift_ptp_process_status value.
+func ParseProcessStatusValue(value string) (int, error) {
+	parsed, err := ParseMetricInteger(value)
+	if err != nil {
+		return 0, err
+	}
+	if parsed != 0 && parsed != 1 {
+		return 0, fmt.Errorf("invalid process status %d", parsed)
+	}
+	return parsed, nil
+}
+
+// ExtractProcessStatus returns the process status for an exact node, config,
+// and process. Missing and ambiguous samples are errors.
+func ExtractProcessStatus(metricsText, nodeName, configName, process string) (int, error) {
+	if metricsText == "" {
+		return 0, fmt.Errorf("empty metrics text")
+	}
+	linePattern := regexp.MustCompile(`(?m)^` + regexp.QuoteMeta(OpenshiftPtpProcessStatus) + `\{([^}]*)\}[ \t]+([^ \t]+)[ \t]*$`)
+	labelPattern := regexp.MustCompile(`^[ \t]*([a-zA-Z_][a-zA-Z0-9_]*)="((?:\\.|[^"\\])*)"[ \t]*$`)
+	var values []string
+	for _, match := range linePattern.FindAllStringSubmatch(metricsText, -1) {
+		labels := map[string]string{}
+		for _, rawLabel := range strings.Split(match[1], ",") {
+			labelMatch := labelPattern.FindStringSubmatch(rawLabel)
+			if labelMatch == nil {
+				return 0, fmt.Errorf("malformed label %q in process status metric", rawLabel)
+			}
+			if _, exists := labels[labelMatch[1]]; exists {
+				return 0, fmt.Errorf("duplicate label %q in process status metric", labelMatch[1])
+			}
+			labels[labelMatch[1]] = labelMatch[2]
+		}
+		if labels["node"] != nodeName || labels["config"] != configName || labels["process"] != process {
+			continue
+		}
+		values = append(values, match[2])
+	}
+	if len(values) != 1 {
+		return 0, fmt.Errorf("expected one process status for node=%s config=%s process=%s, found %d",
+			nodeName, configName, process, len(values))
+	}
+	return ParseProcessStatusValue(values[0])
+}
+
+// ExtractMetricValues returns all exact label matches for one ptp4l metric.
+// Empty and ambiguous samples are errors rather than silently ignored.
+func ExtractMetricValues(metricsText, metricName, nodeName, iface, process string) ([]string, error) {
+	if metricsText == "" {
+		return nil, fmt.Errorf("empty metrics text")
+	}
+	linePattern := regexp.MustCompile(`(?m)^` + regexp.QuoteMeta(metricName) + `\{([^}]*)\}[ \t]+([^ \t]+)[ \t]*$`)
+	labelPattern := regexp.MustCompile(`^[ \t]*([a-zA-Z_][a-zA-Z0-9_]*)="((?:\\.|[^"\\])*)"[ \t]*$`)
+	var values []string
+	for _, match := range linePattern.FindAllStringSubmatch(metricsText, -1) {
+		labels := map[string]string{}
+		for index, rawLabel := range strings.Split(match[1], ",") {
+			labelMatch := labelPattern.FindStringSubmatch(rawLabel)
+			if labelMatch == nil {
+				return nil, fmt.Errorf("malformed label %q in %s metric", rawLabel, metricName)
+			}
+			if index > 0 && labelMatch[1] == "" {
+				return nil, fmt.Errorf("empty label in %s metric", metricName)
+			}
+			if _, exists := labels[labelMatch[1]]; exists {
+				return nil, fmt.Errorf("duplicate label %q in %s metric", labelMatch[1], metricName)
+			}
+			labels[labelMatch[1]] = labelMatch[2]
+		}
+		if labels["node"] != nodeName || labels["iface"] != iface || labels["process"] != process {
+			continue
+		}
+		if match[2] == "" {
+			return nil, fmt.Errorf("empty %s metric value", metricName)
+		}
+		values = append(values, match[2])
+	}
+	if len(values) == 0 {
+		return nil, fmt.Errorf("%s metric for node=%s iface=%s process=%s not found",
+			metricName, nodeName, iface, process)
+	}
+	if len(values) > 1 {
+		return nil, fmt.Errorf("%s metric for node=%s iface=%s process=%s has %d matching samples",
+			metricName, nodeName, iface, process, len(values))
+	}
+	return values, nil
 }
 
 // gets a node name based on a label
@@ -410,7 +523,7 @@ Only this label should be used to identify the clock under test. err:%s`, *label
 		if err != nil {
 			return fmt.Errorf("error getting metric err:%s", err)
 		}
-		roleInt, err := strconv.Atoi(role)
+		roleInt, err := ParseMetricInteger(role)
 		if err != nil {
 			return fmt.Errorf("error strconv for role=%s, err:%s", role, err)
 		}
@@ -431,7 +544,7 @@ Only this label should be used to identify the clock under test. err:%s`, *label
 			ifResults = append(ifResults, fmt.Sprintf("  %s: role metric error: %s", aIf, err))
 			continue
 		}
-		roleInt, err := strconv.Atoi(roleString)
+		roleInt, err := ParseMetricInteger(roleString)
 		if err != nil {
 			return fmt.Errorf("error strconv for roleString=%s, err:%s", roleString, err)
 		}
@@ -449,16 +562,16 @@ Only this label should be used to identify the clock under test. err:%s`, *label
 			ifResults = append(ifResults, fmt.Sprintf("  %s: clock state metric error: %s", aIf, err))
 			continue
 		}
-		clockStateInt, err := strconv.Atoi(clockStateString)
+		clockState, err := ParseClockStateValue(clockStateString)
 		if err != nil {
 			ifResults = append(ifResults, fmt.Sprintf("  %s: clock state strconv error: %s", aIf, err))
 			return fmt.Errorf("error strconv for clockStateString=%s, err:%s. Per-interface results:\n%s", clockStateString, err, strings.Join(ifResults, "\n"))
 		}
-		logrus.Infof("nodeName=%s, aIf=%s, clockStateInt=%s expectedClockstate=%s", *nodeName, aIf, MetricClockState(clockStateInt), expectedClockState)
-		if MetricClockState(clockStateInt) != expectedClockState {
-			ifResults = append(ifResults, fmt.Sprintf("  %s: clock state mismatch (expected=%s, got=%s)", aIf, expectedClockState, MetricClockState(clockStateInt)))
+		logrus.Infof("nodeName=%s, aIf=%s, clockState=%s expectedClockstate=%s", *nodeName, aIf, clockState, expectedClockState)
+		if clockState != expectedClockState {
+			ifResults = append(ifResults, fmt.Sprintf("  %s: clock state mismatch (expected=%s, got=%s)", aIf, expectedClockState, clockState))
 			return fmt.Errorf("incorrect clock state on node %s iface %s: expected %s, got %s. Per-interface results:\n%s",
-				*nodeName, aIf, expectedClockState, MetricClockState(clockStateInt), strings.Join(ifResults, "\n"))
+				*nodeName, aIf, expectedClockState, clockState, strings.Join(ifResults, "\n"))
 		}
 
 		// Check offset
@@ -469,7 +582,7 @@ Only this label should be used to identify the clock under test. err:%s`, *label
 		if err != nil {
 			return fmt.Errorf("error getting offset err:%s", err)
 		}
-		offsetInt, err := strconv.Atoi(offsetString)
+		offsetInt, err := ParseMetricInteger(offsetString)
 		if err != nil {
 			return fmt.Errorf("error strconv for offsetString=%s, err:%s", offsetString, err)
 		}
